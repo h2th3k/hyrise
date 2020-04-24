@@ -12,6 +12,22 @@
 #include "utils/format_duration.hpp"
 #include "utils/timer.hpp"
 
+
+
+
+
+
+
+
+#include "operators/print.hpp"
+
+
+
+
+
+
+
+
 namespace opossum {
 
 void to_json(nlohmann::json& json, const TableGenerationMetrics& metrics) {
@@ -50,7 +66,7 @@ void AbstractTableGenerator::generate_and_store() {
       const auto chunk_count = table->chunk_count();
 
       // Check if table is already sorted
-      auto is_sorted = true;
+      auto is_sorted = false;
       resolve_data_type(table->column_data_type(sort_column_id), [&](auto type) {
         using ColumnDataType = typename decltype(type)::type;
 
@@ -106,7 +122,49 @@ void AbstractTableGenerator::generate_and_store() {
           table_wrapper, std::vector<SortColumnDefinition>{SortColumnDefinition{sort_column_id, order_by_mode}},
           _benchmark_config->chunk_size);
       sort->execute();
-      const auto immutable_sorted_table = sort->get_output();
+      auto immutable_sorted_table = sort->get_output();
+
+      auto get_segments_of_chunk = [&](const std::shared_ptr<const Table>& input_table, ChunkID chunk_id){
+        Segments segments{};
+        for (auto column_id = ColumnID{0}; column_id < input_table->column_count(); ++column_id) {
+          segments.emplace_back(input_table->get_chunk(chunk_id)->get_segment(column_id));
+        }
+        return segments;
+      };
+
+      if (table_name == "lineitem") {
+        std::cout << " (actually, we are clustering by l_shipdate and sort by l_orderkey in each chunk) ";
+        auto sorted_table = std::make_shared<Table>(immutable_sorted_table->column_definitions(), TableType::Data, Chunk::DEFAULT_SIZE, UseMvcc::No);
+
+        for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
+          // create new single chunk and create a new table with that chunk
+          auto new_chunk = std::make_shared<Chunk>(get_segments_of_chunk(immutable_sorted_table, chunk_id));
+          std::vector<std::shared_ptr<Chunk>> single_chunk_to_sort_as_vector = {new_chunk};
+          auto single_chunk_table = std::make_shared<Table>(immutable_sorted_table->column_definitions(), TableType::Data,
+                                                            std::move(single_chunk_to_sort_as_vector), UseMvcc::No);
+
+          // call sort operator on single-chunk table
+          auto table_sort_wrapper = std::make_shared<TableWrapper>(single_chunk_table);
+          table_sort_wrapper->execute();
+          auto single_chunk_table_sort = std::make_shared<Sort>(table_sort_wrapper,
+                                    std::vector<SortColumnDefinition>{SortColumnDefinition{single_chunk_table->column_id_by_name("l_orderkey"),
+                                    OrderByMode::Ascending}}, Chunk::DEFAULT_SIZE);
+          single_chunk_table_sort->execute();
+          const auto immutable_single_chunk_sorted_table = single_chunk_table_sort->get_output();
+
+          // add sorted chunk to output table
+          // Note: we do not care about MVCC at all at the moment
+          sorted_table->append_chunk(get_segments_of_chunk(immutable_single_chunk_sorted_table, ChunkID{0}));
+          const auto& added_chunk = sorted_table->get_chunk(chunk_id);
+          added_chunk->set_ordered_by(std::make_pair(sorted_table->column_id_by_name("l_orderkey"), OrderByMode::Ascending));
+          added_chunk->finalize();
+        }
+
+        // std::cout << "switching" << std::endl;
+        // Print::print(immutable_sorted_table);
+        immutable_sorted_table = sorted_table;
+        // Print::print(immutable_sorted_table);
+      }
 
       Assert(immutable_sorted_table->chunk_count() == table->chunk_count(), "Mismatching chunk_count");
 
