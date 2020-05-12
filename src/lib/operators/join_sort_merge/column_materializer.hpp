@@ -71,7 +71,6 @@ class ColumnMaterializer {
     std::vector<Subsample<T>> subsamples;
     subsamples.reserve(chunk_count);
 
-    std::vector<std::shared_ptr<AbstractTask>> jobs;
     for (ChunkID chunk_id{0}; chunk_id < chunk_count; ++chunk_id) {
       const auto chunk = input->get_chunk(chunk_id);
       Assert(chunk, "Physically deleted chunk should not reach this point, see get_chunk / #1686.");
@@ -79,12 +78,9 @@ class ColumnMaterializer {
       const auto samples_to_write = std::min(samples_per_chunk, chunk->size());
       subsamples.push_back(Subsample<T>(samples_to_write));
 
-      jobs.push_back(
-          _create_chunk_materialization_job(output, null_rows, chunk_id, input, column_id, subsamples.back()));
-      jobs.back()->schedule();
+      _create_chunk_materialization_job(output, null_rows, chunk_id, input, column_id, subsamples.back());
     }
 
-    Hyrise::get().scheduler()->wait_for_tasks(jobs);
 
     auto gathered_samples = std::vector<T>();
     gathered_samples.reserve(samples_per_chunk * chunk_count);
@@ -100,21 +96,19 @@ class ColumnMaterializer {
   /**
    * Creates a job to materialize and sort a chunk.
    **/
-  std::shared_ptr<AbstractTask> _create_chunk_materialization_job(std::unique_ptr<MaterializedSegmentList<T>>& output,
+  void _create_chunk_materialization_job(std::unique_ptr<MaterializedSegmentList<T>>& output,
                                                                   std::unique_ptr<RowIDPosList>& null_rows_output,
                                                                   const ChunkID chunk_id,
                                                                   std::shared_ptr<const Table> input,
                                                                   const ColumnID column_id, Subsample<T>& subsample) {
-    return std::make_shared<JobTask>([this, &output, &null_rows_output, input, column_id, chunk_id, &subsample] {
-      auto segment = input->get_chunk(chunk_id)->get_segment(column_id);
+    auto segment = input->get_chunk(chunk_id)->get_segment(column_id);
 
-      if (const auto dictionary_segment = std::dynamic_pointer_cast<DictionarySegment<T>>(segment)) {
-        (*output)[chunk_id] =
-            _materialize_dictionary_segment(*dictionary_segment, chunk_id, null_rows_output, subsample);
-      } else {
-        (*output)[chunk_id] = _materialize_generic_segment(*segment, chunk_id, null_rows_output, subsample);
-      }
-    });
+    if (const auto dictionary_segment = std::dynamic_pointer_cast<DictionarySegment<T>>(segment)) {
+      (*output)[chunk_id] =
+          _materialize_dictionary_segment(*dictionary_segment, chunk_id, null_rows_output, subsample);
+    } else {
+      (*output)[chunk_id] = _materialize_generic_segment(*segment, chunk_id, null_rows_output, subsample);
+    }
   }
 
   /**

@@ -346,37 +346,30 @@ class JoinHash::JoinHashImpl : public AbstractJoinOperatorImpl {
      */
 
     if (_radix_bits > 0) {
-      auto jobs = std::vector<std::shared_ptr<AbstractTask>>{};
+      // radix partition the build table
+      if (keep_nulls_build_column) {
+        radix_build_column = partition_by_radix<BuildColumnType, HashedType, true>(
+            materialized_build_column, histograms_build_column, _radix_bits);
+      } else {
+        radix_build_column = partition_by_radix<BuildColumnType, HashedType, false>(
+            materialized_build_column, histograms_build_column, _radix_bits);
+      }
 
-      jobs.emplace_back(std::make_shared<JobTask>([&]() {
-        // radix partition the build table
-        if (keep_nulls_build_column) {
-          radix_build_column = partition_by_radix<BuildColumnType, HashedType, true>(
-              materialized_build_column, histograms_build_column, _radix_bits);
-        } else {
-          radix_build_column = partition_by_radix<BuildColumnType, HashedType, false>(
-              materialized_build_column, histograms_build_column, _radix_bits);
-        }
+      // After the data in materialized_build_column has been partitioned, it is not needed anymore.
+      materialized_build_column.clear();
 
-        // After the data in materialized_build_column has been partitioned, it is not needed anymore.
-        materialized_build_column.clear();
-      }));
+      // radix partition the probe column.
+      if (keep_nulls_probe_column) {
+        radix_probe_column = partition_by_radix<ProbeColumnType, HashedType, true>(
+            materialized_probe_column, histograms_probe_column, _radix_bits);
+      } else {
+        radix_probe_column = partition_by_radix<ProbeColumnType, HashedType, false>(
+            materialized_probe_column, histograms_probe_column, _radix_bits);
+      }
 
-      jobs.emplace_back(std::make_shared<JobTask>([&]() {
-        // radix partition the probe column.
-        if (keep_nulls_probe_column) {
-          radix_probe_column = partition_by_radix<ProbeColumnType, HashedType, true>(
-              materialized_probe_column, histograms_probe_column, _radix_bits);
-        } else {
-          radix_probe_column = partition_by_radix<ProbeColumnType, HashedType, false>(
-              materialized_probe_column, histograms_probe_column, _radix_bits);
-        }
+      // After the data in materialized_probe_column has been partitioned, it is not needed anymore.
+      materialized_probe_column.clear();
 
-        // After the data in materialized_probe_column has been partitioned, it is not needed anymore.
-        materialized_probe_column.clear();
-      }));
-
-      Hyrise::get().scheduler()->schedule_and_wait_for_tasks(jobs);
 
       histograms_build_column.clear();
       histograms_probe_column.clear();

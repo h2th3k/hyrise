@@ -90,9 +90,6 @@ std::shared_ptr<const Table> TableScan::_on_execute() {
   auto output_chunks = std::vector<std::shared_ptr<Chunk>>{};
   output_chunks.reserve(in_table->chunk_count() - excluded_chunk_set.size());
 
-  auto jobs = std::vector<std::shared_ptr<AbstractTask>>{};
-  jobs.reserve(in_table->chunk_count() - excluded_chunk_set.size());
-
   const auto chunk_count = in_table->chunk_count();
   for (ChunkID chunk_id{0u}; chunk_id < chunk_count; ++chunk_id) {
     if (excluded_chunk_set.count(chunk_id)) continue;
@@ -100,73 +97,66 @@ std::shared_ptr<const Table> TableScan::_on_execute() {
     Assert(chunk_in, "Physically deleted chunk should not reach this point, see get_chunk / #1686.");
 
     // chunk_in – Copy by value since copy by reference is not possible due to the limited scope of the for-iteration.
-    auto job_task = std::make_shared<JobTask>([this, chunk_id, chunk_in, &in_table, &output_mutex, &output_chunks]() {
-      // The actual scan happens in the sub classes of BaseTableScanImpl
-      const auto matches_out = _impl->scan_chunk(chunk_id);
-      if (matches_out->empty()) return;
+    // The actual scan happens in the sub classes of BaseTableScanImpl
+    const auto matches_out = _impl->scan_chunk(chunk_id);
+    if (matches_out->empty()) continue;
 
-      Segments out_segments;
+    Segments out_segments;
 
-      /**
-       * matches_out contains a list of row IDs into this chunk. If this is not a reference table, we can
-       * directly use the matches to construct the reference segments of the output. If it is a reference segment,
-       * we need to resolve the row IDs so that they reference the physical data segments (value, dictionary) instead,
-       * since we don’t allow multi-level referencing. To save time and space, we want to share position lists
-       * between segments as much as possible. Position lists can be shared between two segments iff
-       * (a) they point to the same table and
-       * (b) the reference segments of the input table point to the same positions in the same order
-       *     (i.e. they share their position list).
-       */
-      if (in_table->type() == TableType::References) {
-        auto filtered_pos_lists = std::map<std::shared_ptr<const AbstractPosList>, std::shared_ptr<RowIDPosList>>{};
+    /**
+     * matches_out contains a list of row IDs into this chunk. If this is not a reference table, we can
+     * directly use the matches to construct the reference segments of the output. If it is a reference segment,
+     * we need to resolve the row IDs so that they reference the physical data segments (value, dictionary) instead,
+     * since we don’t allow multi-level referencing. To save time and space, we want to share position lists
+     * between segments as much as possible. Position lists can be shared between two segments iff
+     * (a) they point to the same table and
+     * (b) the reference segments of the input table point to the same positions in the same order
+     *     (i.e. they share their position list).
+     */
+    if (in_table->type() == TableType::References) {
+      auto filtered_pos_lists = std::map<std::shared_ptr<const AbstractPosList>, std::shared_ptr<RowIDPosList>>{};
 
-        for (ColumnID column_id{0u}; column_id < in_table->column_count(); ++column_id) {
-          auto segment_in = chunk_in->get_segment(column_id);
+      for (ColumnID column_id{0u}; column_id < in_table->column_count(); ++column_id) {
+        auto segment_in = chunk_in->get_segment(column_id);
 
-          auto ref_segment_in = std::dynamic_pointer_cast<const ReferenceSegment>(segment_in);
-          DebugAssert(ref_segment_in, "All segments should be of type ReferenceSegment.");
+        auto ref_segment_in = std::dynamic_pointer_cast<const ReferenceSegment>(segment_in);
+        DebugAssert(ref_segment_in, "All segments should be of type ReferenceSegment.");
 
-          const auto pos_list_in = ref_segment_in->pos_list();
+        const auto pos_list_in = ref_segment_in->pos_list();
 
-          const auto table_out = ref_segment_in->referenced_table();
-          const auto column_id_out = ref_segment_in->referenced_column_id();
+        const auto table_out = ref_segment_in->referenced_table();
+        const auto column_id_out = ref_segment_in->referenced_column_id();
 
-          auto& filtered_pos_list = filtered_pos_lists[pos_list_in];
+        auto& filtered_pos_list = filtered_pos_lists[pos_list_in];
 
-          if (!filtered_pos_list) {
-            filtered_pos_list = std::make_shared<RowIDPosList>(matches_out->size());
-            if (pos_list_in->references_single_chunk()) {
-              filtered_pos_list->guarantee_single_chunk();
-            }
-
-            size_t offset = 0;
-            for (const auto& match : *matches_out) {
-              const auto row_id = (*pos_list_in)[match.chunk_offset];
-              (*filtered_pos_list)[offset] = row_id;
-              ++offset;
-            }
+        if (!filtered_pos_list) {
+          filtered_pos_list = std::make_shared<RowIDPosList>(matches_out->size());
+          if (pos_list_in->references_single_chunk()) {
+            filtered_pos_list->guarantee_single_chunk();
           }
 
-          auto ref_segment_out = std::make_shared<ReferenceSegment>(table_out, column_id_out, filtered_pos_list);
-          out_segments.push_back(ref_segment_out);
+          size_t offset = 0;
+          for (const auto& match : *matches_out) {
+            const auto row_id = (*pos_list_in)[match.chunk_offset];
+            (*filtered_pos_list)[offset] = row_id;
+            ++offset;
+          }
         }
-      } else {
-        matches_out->guarantee_single_chunk();
-        for (ColumnID column_id{0u}; column_id < in_table->column_count(); ++column_id) {
-          auto ref_segment_out = std::make_shared<ReferenceSegment>(in_table, column_id, matches_out);
-          out_segments.push_back(ref_segment_out);
-        }
+
+        auto ref_segment_out = std::make_shared<ReferenceSegment>(table_out, column_id_out, filtered_pos_list);
+        out_segments.push_back(ref_segment_out);
       }
+    } else {
+      matches_out->guarantee_single_chunk();
+      for (ColumnID column_id{0u}; column_id < in_table->column_count(); ++column_id) {
+        auto ref_segment_out = std::make_shared<ReferenceSegment>(in_table, column_id, matches_out);
+        out_segments.push_back(ref_segment_out);
+      }
+    }
 
-      std::lock_guard<std::mutex> lock(output_mutex);
-      output_chunks.emplace_back(std::make_shared<Chunk>(out_segments, nullptr, chunk_in->get_allocator()));
-    });
-
-    jobs.push_back(job_task);
-    job_task->schedule();
+    std::lock_guard<std::mutex> lock(output_mutex);
+    output_chunks.emplace_back(std::make_shared<Chunk>(out_segments, nullptr, chunk_in->get_allocator()));
   }
-
-  Hyrise::get().scheduler()->wait_for_tasks(jobs);
 
   return std::make_shared<Table>(in_table->column_definitions(), TableType::References, std::move(output_chunks));
 }
